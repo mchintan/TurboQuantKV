@@ -54,7 +54,7 @@ SNR ranges from **5-8 dB at 2-bit** to **16-19 dB at 4-bit**, consistent with th
 
 TurboQuant uses a two-stage compression pipeline:
 
-### Stage 1: PolarQuant
+### Stage 1: Normalize, Rotate & Quantize
 
 1. **Extract the norm** of each KV vector and **normalize** to a unit vector
 2. **Rotate** the unit vector using the Walsh-Hadamard Transform (WHT), a fast orthogonal rotation applied in blocks (O(d log b) per vector, where b is block size)
@@ -64,15 +64,15 @@ TurboQuant uses a two-stage compression pipeline:
 
 The key insight: because the post-rotation distribution is mathematically known, the quantizer centroids are optimal without any calibration data.
 
-### Stage 2: QJL (Optional)
+### Stage 2: Residual Correction (Optional)
 
-The Quantized Johnson-Lindenstrauss step corrects systematic bias in attention scores. When enabled, QJL is applied to **keys only** (values don't need bias correction for attention score estimation):
+An optional second stage uses the Quantized Johnson-Lindenstrauss (QJL) transform to correct systematic bias in attention scores. When enabled, this correction is applied to **keys only** (values don't need bias correction for attention score estimation):
 
 1. Compute the quantization **residual** (difference between original and reconstructed key vector)
 2. Project through a random Rademacher matrix (+1/-1) and store only the **signs** (1 bit each)
 3. At inference, use these signs to compute an unbiased correction to attention scores
 
-QJL is disabled by default — empirical results show the MSE-only approach (PolarQuant alone) often performs better at low bit budgets because QJL adds variance that softmax amplifies.
+Residual correction is disabled by default (`use_qjl=False`) — empirical results show the quantize-only approach (Stage 1 alone) often performs better at low bit budgets because the added variance from correction gets amplified by softmax.
 
 ---
 
@@ -155,7 +155,7 @@ TurboQuantConfig(
 
 ## VectorDB Integration
 
-TurboQuantKV's PolarQuant encoder can also be used independently to compress embeddings for vector databases, reducing memory usage while maintaining high retrieval accuracy.
+TurboQuantKV's rotation-and-quantize encoder can also be used independently to compress embeddings for vector databases, reducing memory usage while maintaining high retrieval accuracy.
 
 ### ChromaDB
 
@@ -309,7 +309,7 @@ turboquantkv/
   core/
     rotation.py                # Fast Walsh-Hadamard Transform + random rotation
     codebook.py                # Lloyd-Max centroid precomputation (Beta distribution)
-    quantizer.py               # PolarQuant encoder/decoder + QJL corrector
+    quantizer.py               # Rotation + scalar quantizer, optional residual corrector
     bitpack.py                 # 2/3/4-bit packing into uint8
   cache/
     turboquant_layer.py        # CacheLayerMixin — per-layer compressed storage
@@ -322,7 +322,7 @@ turboquantkv/
 
 - **Walsh-Hadamard Transform** over random rotation: 15-60x better empirical performance at sub-4-bit compression (community finding from llama.cpp implementations). WHT is also deterministic and O(d log d) vs O(d^2) for matrix multiplication.
 - **Block size 32**: Better Flash Attention parallelism than the paper's 128. Divides all common head dims (64, 128, 256).
-- **QJL off by default**: MSE-only quantization empirically outperforms MSE+QJL at low bit budgets because softmax amplifies QJL's added variance.
+- **Residual correction off by default**: MSE-only quantization empirically outperforms quantize+correct at low bit budgets because softmax amplifies the correction's added variance.
 - **Float32 norms**: Key norms can reach 1000+ in some models, exceeding fp16 range (65504). Float32 prevents overflow.
 - **Incremental dequantization**: On each decode step, only the new token is dequantized and concatenated, rather than re-dequantizing the entire history.
 
