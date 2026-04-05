@@ -6,15 +6,37 @@ build-backend = "setuptools.build_meta"
 name = "turboquantkv"
 version = "0.1.0"
 description = "TurboQuant KV cache compression for LLM inference"
+readme = "README.md"
+license = {text = "MIT"}
 requires-python = ">=3.10"
+authors = [
+    {name = "mchintan", email = "chintan.mehta@gmail.com"},
+]
+keywords = ["llm", "kv-cache", "quantization", "compression", "transformers", "inference"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "torch>=2.1.0",
     "transformers>=4.45.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/mchintan/TurboQuantKV"
+Repository = "https://github.com/mchintan/TurboQuantKV"
+Issues = "https://github.com/mchintan/TurboQuantKV/issues"
+
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "datasets", "accelerate"]
-bench = ["datasets", "accelerate", "tqdm", "jinja2"]
+bench = ["datasets", "accelerate", "tqdm", "jinja2", "matplotlib"]
 
 [tool.setuptools.packages.find]
 include = ["turboquantkv*"]
