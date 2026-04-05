@@ -2,7 +2,7 @@
 
 A Python implementation of the [TurboQuant](https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/) paper (Google Research, ICLR 2026) for extreme KV cache compression in LLM inference.
 
-TurboQuantKV compresses the key-value cache to 2-4 bits per value with minimal accuracy loss, achieving **3-7x memory reduction** over FP16 with no calibration data or fine-tuning required. It works as a drop-in replacement for HuggingFace transformers' `DynamicCache`.
+TurboQuantKV compresses the key-value cache to 2-4 bits per value with minimal accuracy loss, achieving **3-7x memory reduction** over FP16 with no calibration data or fine-tuning required. At 4-bit, cosine similarity exceeds **0.988** across all tested head dimensions. It works as a drop-in replacement for HuggingFace transformers' `DynamicCache`.
 
 **Author:** [mchintan](https://github.com/mchintan)
 
@@ -14,7 +14,7 @@ All benchmarks were run on synthetic and real data across multiple configuration
 
 ### Quality vs Compression Trade-off
 
-The fundamental trade-off: higher bit widths preserve more quality, while lower bit widths compress more aggressively. TurboQuantKV achieves **>0.99 cosine similarity at 4-bit** and **>0.92 even at 2-bit**.
+The fundamental trade-off: higher bit widths preserve more quality, while lower bit widths compress more aggressively. TurboQuantKV achieves **>0.98 cosine similarity at 4-bit** and **>0.87 at 2-bit** (higher with smaller head dimensions).
 
 ![Quality vs Compression Trade-off](docs/images/quality_vs_compression.png)
 
@@ -56,19 +56,20 @@ TurboQuant uses a two-stage compression pipeline:
 
 ### Stage 1: PolarQuant
 
-1. **Rotate** each KV vector using the Walsh-Hadamard Transform (WHT), a fast orthogonal rotation (O(d log d))
-2. After rotation, all coordinates become nearly identically distributed (Beta distribution) — this is a property of high-dimensional geometry
-3. **Scalar quantize** each coordinate independently using Lloyd-Max optimal centroids precomputed from the known distribution
-4. Store the **quantized indices** (2-4 bits per coordinate) and the **vector norm** (float32)
+1. **Extract the norm** of each KV vector and **normalize** to a unit vector
+2. **Rotate** the unit vector using the Walsh-Hadamard Transform (WHT), a fast orthogonal rotation applied in blocks (O(d log b) per vector, where b is block size)
+3. After rotation, all coordinates become nearly identically distributed — specifically, each squared coordinate follows a Beta(0.5, (d-1)/2) distribution — this is a property of high-dimensional geometry
+4. **Scalar quantize** each coordinate independently using Lloyd-Max optimal centroids precomputed from the known distribution
+5. Store the **quantized indices** (2-4 bits per coordinate) and the **vector norm** (float32)
 
 The key insight: because the post-rotation distribution is mathematically known, the quantizer centroids are optimal without any calibration data.
 
 ### Stage 2: QJL (Optional)
 
-The Quantized Johnson-Lindenstrauss step corrects systematic bias in attention scores:
+The Quantized Johnson-Lindenstrauss step corrects systematic bias in attention scores. When enabled, QJL is applied to **keys only** (values don't need bias correction for attention score estimation):
 
-1. Compute the quantization **residual** (difference between original and reconstructed vector)
-2. Project through a random sign matrix and store only the **signs** (1 bit each)
+1. Compute the quantization **residual** (difference between original and reconstructed key vector)
+2. Project through a random Rademacher matrix (+1/-1) and store only the **signs** (1 bit each)
 3. At inference, use these signs to compute an unbiased correction to attention scores
 
 QJL is disabled by default — empirical results show the MSE-only approach (PolarQuant alone) often performs better at low bit budgets because QJL adds variance that softmax amplifies.
@@ -92,7 +93,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from turboquantkv import TurboQuantCache, TurboQuantConfig
 
 # Load any HuggingFace model
-model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2-0.5B", dtype=torch.float16, device_map="auto")
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2-0.5B", torch_dtype=torch.float16, device_map="auto")
 tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2-0.5B")
 
 # Create TurboQuant compressed cache
@@ -135,7 +136,7 @@ TurboQuantConfig(
     value_bits=4,         # Bits for value quantization: 2, 3, or 4
     rotation_type="wht",  # "wht" (Walsh-Hadamard) or "random" (orthogonal matrix)
     block_size=32,        # WHT block size (power of 2, must divide head_dim)
-    use_qjl=False,        # Enable QJL residual correction
+    use_qjl=False,        # Enable QJL residual correction (keys only)
     qjl_dim=64,           # Number of QJL random projections
     seed=42,              # Random seed for reproducibility
 )
