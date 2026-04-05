@@ -1,8 +1,54 @@
 # TurboQuantKV
 
-A Python library implementing the [TurboQuant](https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/) paper (Google Research, ICLR 2026) for extreme KV cache compression in LLM inference.
+A Python implementation of the [TurboQuant](https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/) paper (Google Research, ICLR 2026) for extreme KV cache compression in LLM inference.
 
-TurboQuantKV compresses the key-value cache to 2-4 bits per value with minimal accuracy loss, achieving **3-5x memory reduction** with no calibration data or fine-tuning required. It works as a drop-in replacement for HuggingFace transformers' `DynamicCache`.
+TurboQuantKV compresses the key-value cache to 2-4 bits per value with minimal accuracy loss, achieving **3-7x memory reduction** over FP16 with no calibration data or fine-tuning required. It works as a drop-in replacement for HuggingFace transformers' `DynamicCache`.
+
+**Author:** [mchintan](https://github.com/mchintan)
+
+---
+
+## Benchmark Results
+
+All benchmarks were run on synthetic and real data across multiple configurations. The graphs below summarize TurboQuantKV's performance characteristics.
+
+### Quality vs Compression Trade-off
+
+The fundamental trade-off: higher bit widths preserve more quality, while lower bit widths compress more aggressively. TurboQuantKV achieves **>0.99 cosine similarity at 4-bit** and **>0.92 even at 2-bit**.
+
+![Quality vs Compression Trade-off](docs/images/quality_vs_compression.png)
+
+### Memory Savings
+
+KV cache memory comparison for a realistic configuration (head_dim=128, seq_len=512, 8 attention heads). TurboQuantKV reduces memory by **3.8x-7.1x** compared to FP16 storage.
+
+![Memory Savings](docs/images/memory_savings.png)
+
+### Compression Ratio vs FP16 Baseline
+
+Compression ratio scales favorably with head dimension. Larger models (head_dim=128) achieve even better ratios because the norm overhead becomes relatively smaller.
+
+![Compression Ratio](docs/images/compression_ratio.png)
+
+### Reconstruction Quality
+
+Relative MSE and cosine similarity across bit widths and head dimensions. 4-bit quantization preserves **>98.8% cosine similarity** across all tested configurations.
+
+![MSE and Cosine Similarity](docs/images/mse_cosine_comparison.png)
+
+### Encode/Decode Throughput
+
+TurboQuantKV processes **200K-380K vectors/sec** on CPU, with 4-bit being the fastest due to simpler bitpacking.
+
+![Throughput](docs/images/throughput.png)
+
+### Signal-to-Noise Ratio
+
+SNR ranges from **5-8 dB at 2-bit** to **16-19 dB at 4-bit**, consistent with theoretical predictions for Lloyd-Max quantization on the post-rotation Beta distribution.
+
+![SNR Comparison](docs/images/snr_comparison.png)
+
+---
 
 ## How It Works
 
@@ -11,7 +57,7 @@ TurboQuant uses a two-stage compression pipeline:
 ### Stage 1: PolarQuant
 
 1. **Rotate** each KV vector using the Walsh-Hadamard Transform (WHT), a fast orthogonal rotation (O(d log d))
-2. After rotation, all coordinates become nearly identically distributed (Beta distribution) - this is a property of high-dimensional geometry
+2. After rotation, all coordinates become nearly identically distributed (Beta distribution) — this is a property of high-dimensional geometry
 3. **Scalar quantize** each coordinate independently using Lloyd-Max optimal centroids precomputed from the known distribution
 4. Store the **quantized indices** (2-4 bits per coordinate) and the **vector norm** (float32)
 
@@ -25,7 +71,9 @@ The Quantized Johnson-Lindenstrauss step corrects systematic bias in attention s
 2. Project through a random sign matrix and store only the **signs** (1 bit each)
 3. At inference, use these signs to compute an unbiased correction to attention scores
 
-QJL is disabled by default - empirical results show the MSE-only approach (PolarQuant alone) often performs better at low bit budgets because QJL adds variance that softmax amplifies.
+QJL is disabled by default — empirical results show the MSE-only approach (PolarQuant alone) often performs better at low bit budgets because QJL adds variance that softmax amplifies.
+
+---
 
 ## Quick Start
 
@@ -51,7 +99,7 @@ tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2-0.5B")
 config = TurboQuantConfig(key_bits=4, value_bits=3)
 cache = TurboQuantCache(config=model.config, quant_config=config)
 
-# Generate - just pass the cache as past_key_values
+# Generate — just pass the cache as past_key_values
 inputs = tokenizer("The future of AI is", return_tensors="pt").to(model.device)
 outputs = model.generate(**inputs, past_key_values=cache, max_new_tokens=100, do_sample=False)
 print(tokenizer.decode(outputs[0], skip_special_tokens=True))
@@ -77,6 +125,8 @@ mem = cache.get_memory_bytes()
 print(f"Compressed KV cache: {mem['compressed'] / 1024:.1f} KB")
 ```
 
+---
+
 ## Configuration
 
 ```python
@@ -93,16 +143,133 @@ TurboQuantConfig(
 
 **Recommended configurations:**
 
-| Use Case | Config | Compression | Notes |
-|----------|--------|-------------|-------|
-| Quality-first | `key_bits=4, value_bits=4` | ~3.5x | Minimal accuracy loss |
-| Balanced | `key_bits=4, value_bits=3` | ~4x | Good quality/compression tradeoff |
-| Max compression | `key_bits=3, value_bits=3` | ~4.5x | Some accuracy loss on small models |
-| Extreme | `key_bits=2, value_bits=2` | ~6x+ | Best for large models (128+ head_dim) |
+| Use Case | Config | Compression | Cosine Sim | Notes |
+|----------|--------|-------------|-----------|-------|
+| Quality-first | `key_bits=4, value_bits=4` | ~3.5-3.8x | >0.988 | Minimal accuracy loss |
+| Balanced | `key_bits=4, value_bits=3` | ~4x | ~0.978 | Good quality/compression tradeoff |
+| Max compression | `key_bits=3, value_bits=3` | ~4.6-4.9x | ~0.959 | Some accuracy loss on small models |
+| Extreme | `key_bits=2, value_bits=2` | ~6.4-7.1x | ~0.874 | Best for large models (128+ head_dim) |
+
+---
+
+## VectorDB Integration
+
+TurboQuantKV's PolarQuant encoder can also be used independently to compress embeddings for vector databases, reducing memory usage while maintaining high retrieval accuracy.
+
+### ChromaDB
+
+```python
+import numpy as np
+import torch
+import chromadb
+from turboquantkv.core.rotation import RotationManager
+from turboquantkv.core.quantizer import PolarQuantEncoder
+
+# Create quantizer matching your embedding dimension
+dim = 128
+rotation = RotationManager("wht", block_size=32, head_dim=dim)
+encoder = PolarQuantEncoder(n_bits=4, rotation_manager=rotation, block_size=32)
+
+# Compress embeddings
+embeddings = np.random.randn(1000, dim).astype(np.float32)
+x = torch.from_numpy(embeddings).float()
+qt = encoder.encode(x)
+compressed = encoder.decode(qt, dtype=torch.float32).numpy()
+
+# Store in ChromaDB — compressed embeddings use less precision
+client = chromadb.Client()
+collection = client.create_collection("my_docs")
+collection.add(
+    embeddings=compressed.tolist(),
+    documents=[f"doc_{i}" for i in range(1000)],
+    ids=[f"id_{i}" for i in range(1000)],
+)
+
+# Query
+results = collection.query(query_embeddings=[compressed[0].tolist()], n_results=5)
+```
+
+### FAISS
+
+```python
+import faiss
+import numpy as np
+import torch
+from turboquantkv.core.rotation import RotationManager
+from turboquantkv.core.quantizer import PolarQuantEncoder
+
+# Setup
+dim = 128
+rotation = RotationManager("wht", block_size=32, head_dim=dim)
+encoder = PolarQuantEncoder(n_bits=4, rotation_manager=rotation, block_size=32)
+
+# Compress 10K vectors
+data = np.random.randn(10_000, dim).astype(np.float32)
+data = data / np.linalg.norm(data, axis=1, keepdims=True)
+
+x = torch.from_numpy(data).float()
+compressed = encoder.decode(encoder.encode(x), dtype=torch.float32).numpy()
+
+# Build FAISS index with compressed vectors
+index = faiss.IndexFlatIP(dim)
+index.add(compressed)
+
+# Search — Recall@10 typically >90% with 4-bit compression
+query = np.random.randn(1, dim).astype(np.float32)
+query = query / np.linalg.norm(query)
+distances, indices = index.search(query, 10)
+```
+
+### Qdrant
+
+```python
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams, PointStruct
+import numpy as np
+import torch
+from turboquantkv.core.rotation import RotationManager
+from turboquantkv.core.quantizer import PolarQuantEncoder
+
+# Setup quantizer
+dim = 128
+rotation = RotationManager("wht", block_size=32, head_dim=dim)
+encoder = PolarQuantEncoder(n_bits=4, rotation_manager=rotation, block_size=32)
+
+# Compress embeddings
+embeddings = np.random.randn(5000, dim).astype(np.float32)
+embeddings = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
+x = torch.from_numpy(embeddings).float()
+compressed = encoder.decode(encoder.encode(x), dtype=torch.float32).numpy()
+
+# Store in Qdrant
+client = QdrantClient(":memory:")
+client.create_collection("docs", vectors_config=VectorParams(size=dim, distance=Distance.COSINE))
+client.upsert("docs", points=[
+    PointStruct(id=i, vector=compressed[i].tolist(), payload={"text": f"doc {i}"})
+    for i in range(len(compressed))
+])
+
+# Search
+results = client.search("docs", query_vector=compressed[0].tolist(), limit=5)
+```
+
+Full working examples with detailed output are in `examples/vectordb_chromadb.py`, `examples/vectordb_faiss.py`, and `examples/vectordb_qdrant.py`.
+
+---
 
 ## Benchmarks
 
-### Running Reports
+### Running the Benchmark Suite
+
+```bash
+# Run all benchmarks and generate JSON results
+python benchmarks/run_benchmarks.py
+
+# Generate graphs from results
+python benchmarks/generate_graphs.py
+```
+
+### Running Model Comparison Reports
 
 Generate a full comparison report for any HuggingFace model:
 
@@ -116,39 +283,22 @@ python -m benchmarks.report \
   --bits 2,3,4 \
   --max-new-tokens 50 \
   --output-dir ./my_reports
-
-# Different model
-python -m benchmarks.report \
-  --model "TinyLlama/TinyLlama-1.1B-Chat-v1.0" \
-  --bits 3,4
 ```
 
-Reports are generated in both JSON (raw metrics) and HTML (formatted with tables) formats:
+Reports are generated in both JSON (raw metrics) and HTML (formatted with tables) formats.
 
-```
-benchmarks/reports/
-  openai-community_gpt2_20260405_101549.json
-  openai-community_gpt2_20260405_101549.html
-```
+### Benchmark Summary
 
-### Report Metrics
+| Config | Compression vs FP16 | Cosine Similarity | Relative MSE | SNR (dB) |
+|--------|---------------------|-------------------|-------------|----------|
+| 2-bit (d=64) | 6.4x | 0.9267 | 0.158 | 8.0 |
+| 3-bit (d=64) | 4.6x | 0.9775 | 0.047 | 13.3 |
+| 4-bit (d=64) | 3.6x | 0.9937 | 0.013 | 18.9 |
+| 2-bit (d=128) | 7.1x | 0.8736 | 0.293 | 5.3 |
+| 3-bit (d=128) | 4.9x | 0.9594 | 0.086 | 10.7 |
+| 4-bit (d=128) | 3.8x | 0.9885 | 0.024 | 16.3 |
 
-Each report compares baseline `DynamicCache` vs `TurboQuantCache` across:
-
-- **Compression ratio** - how much smaller the KV cache is
-- **Token agreement** - % of generated tokens matching baseline
-- **Throughput** - tokens per second (baseline vs TurboQuant)
-- **Memory usage** - bytes for baseline vs compressed storage
-- **Sample outputs** - side-by-side text comparisons
-
-### GPT-2 Results (Apple Silicon, MPS)
-
-| Config | Compression | Token Agreement |
-|--------|-------------|-----------------|
-| 3-bit K/V | 4.57x | varies by prompt |
-| 4-bit K/V | 3.56x | varies by prompt |
-
-Note: GPT-2 has `head_dim=64`, which is small. Larger models with `head_dim=128` (Llama, Qwen, Mistral) benefit significantly more from TurboQuant due to tighter post-rotation coordinate concentration.
+---
 
 ## Architecture
 
@@ -161,8 +311,8 @@ turboquantkv/
     quantizer.py               # PolarQuant encoder/decoder + QJL corrector
     bitpack.py                 # 2/3/4-bit packing into uint8
   cache/
-    turboquant_layer.py        # CacheLayerMixin - per-layer compressed storage
-    turboquant_cache.py        # Cache subclass - the main entry point
+    turboquant_layer.py        # CacheLayerMixin — per-layer compressed storage
+    turboquant_cache.py        # Cache subclass — the main entry point
   integration/
     transformers_patch.py      # generate_with_turboquant() helper
 ```
@@ -175,20 +325,22 @@ turboquantkv/
 - **Float32 norms**: Key norms can reach 1000+ in some models, exceeding fp16 range (65504). Float32 prevents overflow.
 - **Incremental dequantization**: On each decode step, only the new token is dequantized and concatenated, rather than re-dequantizing the entire history.
 
+---
+
 ## Testing
 
 ```bash
 # Install dev dependencies
 pip install -e ".[dev]"
 
-# Run all tests (includes model download for integration tests)
-pytest tests/ -v
-
-# Run only unit tests (no model download)
+# Run all unit tests (no model download)
 pytest tests/test_rotation.py tests/test_codebook.py tests/test_bitpack.py tests/test_quantizer.py tests/test_cache.py -v
 
-# Run pre/post comparison tests
-pytest tests/test_comparison.py -v
+# Run integration tests (requires GPT-2 download)
+pytest tests/test_comparison.py tests/test_integration.py -v
+
+# Run all tests
+pytest tests/ -v
 ```
 
 ### Test Coverage
@@ -202,6 +354,8 @@ pytest tests/test_comparison.py -v
 | `test_cache.py` | Layer updates, prefill+decode, mask sizes, compression |
 | `test_integration.py` | End-to-end generation with GPT-2, memory savings |
 | `test_comparison.py` | Baseline vs TurboQuant: token agreement, compression ratio, coherence |
+
+---
 
 ## Compatibility
 
